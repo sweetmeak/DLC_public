@@ -1,0 +1,717 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * Сохраняет диагностический ответ VK в app/nolabel_debug.
+ * Файлы имеют PHP-защиту: при прямом открытии через браузер
+ * их содержимое не отображается.
+ */
+function nolabel_vk_save_debug_response(string $host, string $response): ?string
+{
+    if ($response === '') {
+        return null;
+    }
+
+    $directory = __DIR__ . DIRECTORY_SEPARATOR . 'nolabel_debug';
+
+    if (!is_dir($directory)) {
+        if (!@mkdir($directory, 0755, true) && !is_dir($directory)) {
+            return null;
+        }
+    }
+
+    if (!is_writable($directory)) {
+        return null;
+    }
+
+    $index = $directory . DIRECTORY_SEPARATOR . 'index.php';
+
+    if (!is_file($index)) {
+        @file_put_contents(
+            $index,
+            "<?php http_response_code(404); exit;\n"
+        );
+    }
+
+    $hostPrefix = preg_replace('/[^a-z0-9_-]/i', '', $host);
+
+    try {
+        $filename = 'vk_' . $hostPrefix . '_' . bin2hex(random_bytes(12)) . '.txt.php';
+    } catch (Throwable $e) {
+        return null;
+    }
+
+    $filePath = $directory . DIRECTORY_SEPARATOR . $filename;
+
+    $protectedResponse = "<?php http_response_code(404); exit; __halt_compiler(); ?>\n"
+        . $response;
+
+    $written = @file_put_contents(
+        $filePath,
+        $protectedResponse,
+        LOCK_EX
+    );
+
+    if ($written === false) {
+        return null;
+    }
+
+    @chmod($filePath, 0600);
+
+    return $filePath;
+}
+
+/**
+ * Извлекает объект плейлиста из разных вариантов JSON-ответа VK.
+ */
+function nolabel_vk_find_playlist_node(array $data): ?array
+{
+    $queue = [$data];
+    $visited = 0;
+
+    while ($queue && $visited < 10000) {
+        $node = array_shift($queue);
+        $visited++;
+
+        if (!is_array($node)) {
+            continue;
+        }
+
+        if (
+            isset($node['type'])
+            && $node['type'] === 'playlist'
+            && isset($node['list'])
+            && is_array($node['list'])
+        ) {
+            return $node;
+        }
+
+        foreach ($node as $value) {
+            if (is_array($value)) {
+                $queue[] = $value;
+            }
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Безопасно декодирует JSON-ответ VK.
+ */
+function nolabel_vk_decode_response(string $response): ?array
+{
+    $response = preg_replace(
+        '~^\s*<\?php.*?\?>\s*~s',
+        '',
+        $response,
+        1
+    ) ?? $response;
+
+    $response = trim($response);
+
+    $decoded = json_decode($response, true);
+
+    if (is_array($decoded)) {
+        return $decoded;
+    }
+
+    $response = html_entity_decode(
+        $response,
+        ENT_QUOTES | ENT_HTML5,
+        'UTF-8'
+    );
+
+    $decoded = json_decode($response, true);
+
+    if (is_array($decoded)) {
+        return $decoded;
+    }
+
+    return null;
+}
+
+/**
+ * Reads public playlist metadata from VK.
+ * Does not modify the PMD statistics or reward pipeline.
+ */
+function nolabel_vk_playlist_metadata(string $url): array
+{
+    if (!vk_playlist_url_is_valid($url)) {
+        return [
+            'ok' => false,
+            'error' => 'Некорректная ссылка на плейлист VK.'
+        ];
+    }
+
+    if (!function_exists('curl_init')) {
+        return [
+            'ok' => false,
+            'error' => 'На сервере не включено PHP-расширение cURL.'
+        ];
+    }
+
+    $parts = parse_url($url);
+    $path = (string)($parts['path'] ?? '');
+
+    $ownerId = null;
+    $playlistId = null;
+    $accessKey = '';
+
+    if (preg_match('~^/music/playlist/(-?\d+)_(\d+)(?:_([a-f0-9]+))?/?$~i', $path, $m)) {
+        $ownerId = (int)$m[1];
+        $playlistId = (int)$m[2];
+        $accessKey = $m[3] ?? '';
+    }
+
+    if ($ownerId === null || $playlistId === null) {
+        return [
+            'ok' => false,
+            'error' => 'Не удалось определить ID плейлиста VK.'
+        ];
+    }
+
+    $diagnostics = [
+        'curl' => true,
+        'dom' => class_exists('DOMDocument'),
+        'page_http' => 0,
+        'page_bytes' => 0,
+        'title_found' => false,
+        'artists_found' => 0,
+        'tracks_found' => 0,
+        'section_attempts' => [],
+        'debug_files' => []
+    ];
+
+    /*
+     * Получаем страницу плейлиста.
+     */
+    $ch = curl_init($url);
+
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_CONNECTTIMEOUT => 7,
+        CURLOPT_TIMEOUT => 20,
+        CURLOPT_ENCODING => '',
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36',
+        CURLOPT_HTTPHEADER => [
+            'Accept-Language: ru-RU,ru;q=0.9,en;q=0.7'
+        ],
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS
+    ]);
+
+    $html = curl_exec($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $diagnostics['page_http'] = $status;
+    $diagnostics['page_bytes'] = is_string($html) ? strlen($html) : 0;
+
+    if (!is_string($html) || $html === '' || $status < 200 || $status >= 300) {
+        return [
+            'ok' => false,
+            'error' => 'VK не отдал страницу плейлиста (HTTP ' . $status . ').',
+            'diagnostics' => $diagnostics
+        ];
+    }
+
+    $decode = static function (string $value): string {
+        $value = html_entity_decode(
+            $value,
+            ENT_QUOTES | ENT_HTML5,
+            'UTF-8'
+        );
+
+        $value = strip_tags($value);
+
+        return trim(preg_replace('/\s+/u', ' ', $value) ?? $value);
+    };
+
+    $title = '';
+    $cover = '';
+    $playlistAuthor = '';
+    $listens = 0;
+    $tracks = [];
+    $artists = [];
+
+    /*
+     * Добавление артиста с защитой от дубликатов.
+     */
+    $addArtist = static function ($raw) use (&$artists): void {
+        if (!is_string($raw) && !is_numeric($raw)) {
+            return;
+        }
+
+        $name = trim(
+            html_entity_decode(
+                (string)$raw,
+                ENT_QUOTES | ENT_HTML5,
+                'UTF-8'
+            )
+        );
+
+        $name = preg_replace('/\s+/u', ' ', $name) ?? $name;
+
+        if (
+            $name === ''
+            || (function_exists('mb_strlen')
+                ? mb_strlen($name, 'UTF-8')
+                : strlen($name)) > 190
+        ) {
+            return;
+        }
+
+        $key = function_exists('mb_strtolower')
+            ? mb_strtolower($name, 'UTF-8')
+            : strtolower($name);
+
+        foreach ($artists as $existing) {
+            $existingKey = function_exists('mb_strtolower')
+                ? mb_strtolower($existing, 'UTF-8')
+                : strtolower($existing);
+
+            if ($existingKey === $key) {
+                return;
+            }
+        }
+
+        $artists[] = $name;
+    };
+
+    /*
+     * Метаданные из HTML.
+     */
+    if (
+        preg_match('~<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)~iu', $html, $mm)
+        || preg_match('~<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']~iu', $html, $mm)
+    ) {
+        $title = $decode($mm[1]);
+    }
+
+    if ($title === '' && preg_match('~<title[^>]*>(.*?)</title>~isu', $html, $mm)) {
+        $title = $decode($mm[1]);
+    }
+
+    if (
+        preg_match('~<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)~iu', $html, $mm)
+        || preg_match('~<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']~iu', $html, $mm)
+    ) {
+        $candidate = html_entity_decode(
+            $mm[1],
+            ENT_QUOTES | ENT_HTML5,
+            'UTF-8'
+        );
+
+        if (
+            filter_var($candidate, FILTER_VALIDATE_URL)
+            && in_array(
+                strtolower((string)parse_url($candidate, PHP_URL_SCHEME)),
+                ['http', 'https'],
+                true
+            )
+        ) {
+            $cover = $candidate;
+        }
+    }
+
+    /*
+     * Запрос реальных данных плейлиста.
+     */
+    $hosts = [
+        'vk.ru' => 'https://vk.ru/al_audio.php',
+        'vk.com' => 'https://vk.com/al_audio.php'
+    ];
+
+    foreach ($hosts as $host => $endpoint) {
+        $post = [
+            'al' => 1,
+            'act' => 'load_section',
+            'claim' => 0,
+            'owner_id' => $ownerId,
+            'playlist_id' => $playlistId,
+            'type' => 'playlist'
+        ];
+
+        if ($accessKey !== '') {
+            $post['access_hash'] = $accessKey;
+        }
+
+        $api = curl_init($endpoint);
+
+        curl_setopt_array($api, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => http_build_query($post),
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_CONNECTTIMEOUT => 7,
+            CURLOPT_TIMEOUT => 20,
+            CURLOPT_ENCODING => '',
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36',
+            CURLOPT_HTTPHEADER => [
+                'Accept: */*',
+                'Accept-Language: ru-RU,ru;q=0.9,en;q=0.7',
+                'Content-Type: application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With: XMLHttpRequest',
+                'Origin: https://' . $host,
+                'Referer: ' . $url
+            ],
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS
+        ]);
+
+        $response = curl_exec($api);
+        $http = (int)curl_getinfo($api, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($api);
+        curl_close($api);
+
+        $attempt = [
+            'host' => $host,
+            'http' => $http,
+            'bytes' => is_string($response) ? strlen($response) : 0,
+            'tracks' => 0,
+            'artists' => 0,
+            'debug_file' => null,
+            'curl_error' => $curlError
+        ];
+
+        if (
+            !is_string($response)
+            || $response === ''
+            || $http < 200
+            || $http >= 300
+        ) {
+            $diagnostics['section_attempts'][] = $attempt;
+            continue;
+        }
+
+        /*
+         * Сохраняем исходный ответ для диагностики.
+         */
+        $debugFile = nolabel_vk_save_debug_response(
+            $host,
+            $response
+        );
+
+        $attempt['debug_file'] = $debugFile;
+
+        if ($debugFile !== null) {
+            $diagnostics['debug_files'][] = [
+                'host' => $host,
+                'path' => $debugFile,
+                'bytes' => strlen($response)
+            ];
+        }
+
+        /*
+         * Декодируем JSON.
+         */
+        $data = nolabel_vk_decode_response($response);
+
+        if (!is_array($data)) {
+            $diagnostics['section_attempts'][] = $attempt;
+            continue;
+        }
+
+        /*
+         * Основной объект плейлиста:
+         * payload[1][0].
+         *
+         * Дополнительно предусмотрен рекурсивный поиск,
+         * если VK поменяет вложенность ответа.
+         */
+        $playlist = null;
+
+        if (isset($data['payload'][1][0]) && is_array($data['payload'][1][0])) {
+            $playlist = $data['payload'][1][0];
+        }
+
+        if (
+            !is_array($playlist)
+            || ($playlist['type'] ?? '') !== 'playlist'
+            || !isset($playlist['list'])
+        ) {
+            $playlist = nolabel_vk_find_playlist_node($data);
+        }
+
+        if (!is_array($playlist)) {
+            $diagnostics['section_attempts'][] = $attempt;
+            continue;
+        }
+
+        /*
+         * Название плейлиста.
+         */
+        if (!empty($playlist['title'])) {
+            $title = trim((string)$playlist['title']);
+            $diagnostics['title_found'] = true;
+        }
+
+        /*
+         * Автор плейлиста.
+         */
+        if (!empty($playlist['authorName'])) {
+            $playlistAuthor = trim((string)$playlist['authorName']);
+            $addArtist($playlistAuthor);
+        }
+
+        /*
+         * Обложка плейлиста.
+         */
+        if (!empty($playlist['coverUrl'])) {
+            $candidateCover = (string)$playlist['coverUrl'];
+
+            if (filter_var($candidateCover, FILTER_VALIDATE_URL)) {
+                $cover = $candidateCover;
+            }
+        }
+
+        /*
+         * Прослушивания плейлиста.
+         */
+        $listens = max(0, (int)($playlist['listens'] ?? 0));
+
+        /*
+         * Список треков.
+         *
+         * Подтверждённые позиции:
+         * [3]  — название трека;
+         * [4]  — исполнитель;
+         * [14] — обложка трека;
+         * [17] — дополнительная информация;
+         * [19] — массив объектов исполнителей.
+         */
+        $rows = $playlist['list'] ?? [];
+
+        if (is_array($rows)) {
+            foreach ($rows as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+
+                $trackTitle = trim((string)($row[3] ?? ''));
+                $fallbackArtist = trim((string)($row[4] ?? ''));
+
+                if ($trackTitle === '') {
+                    continue;
+                }
+
+                $trackArtists = [];
+
+                /*
+                 * Предпочитаем полный массив исполнителей.
+                 */
+                $performers = $row[19] ?? [];
+
+                if (is_array($performers)) {
+                    foreach ($performers as $performer) {
+                        if (!is_array($performer)) {
+                            continue;
+                        }
+
+                        $performerName = trim(
+                            (string)($performer['name'] ?? '')
+                        );
+
+                        if ($performerName === '') {
+                            continue;
+                        }
+
+                        $trackArtists[] = $performerName;
+                        $addArtist($performerName);
+                    }
+                }
+
+                /*
+                 * Резервное поле исполнителя.
+                 */
+                if (!$trackArtists && $fallbackArtist !== '') {
+                    $trackArtists[] = $fallbackArtist;
+                    $addArtist($fallbackArtist);
+                }
+
+                /*
+                 * Обложка трека.
+                 */
+                $trackCover = '';
+
+                if (!empty($row[14]) && is_string($row[14])) {
+                    $coverParts = explode(',', $row[14]);
+                    $trackCover = trim($coverParts[0]);
+
+                    if (!filter_var($trackCover, FILTER_VALIDATE_URL)) {
+                        $trackCover = '';
+                    }
+                }
+
+                /*
+                 * Длительность.
+                 */
+                $extra = $row[17] ?? [];
+                $duration = 0;
+
+                if (is_array($extra)) {
+                    $duration = max(
+                        0,
+                        (int)($extra['duration'] ?? 0)
+                    );
+                }
+
+                $tracks[] = [
+                    'id' => (int)($row[0] ?? 0),
+                    'owner_id' => (int)($row[1] ?? 0),
+                    'title' => $trackTitle,
+                    'artist' => $fallbackArtist,
+                    'artists' => array_values(array_unique($trackArtists)),
+                    'duration' => $duration,
+                    'cover_url' => $trackCover
+                ];
+            }
+        }
+
+        $attempt['tracks'] = count($tracks);
+        $attempt['artists'] = count($artists);
+
+        $diagnostics['section_attempts'][] = $attempt;
+
+        /*
+         * Если получены треки или артисты,
+         * второй домен уже не нужен.
+         */
+        if ($tracks || $artists) {
+            break;
+        }
+    }
+
+    if ($title === '') {
+        $title = 'VK playlist ' . $playlistId;
+    }
+
+    $diagnostics['title_found'] = ($title !== '');
+    $diagnostics['artists_found'] = count($artists);
+    $diagnostics['tracks_found'] = count($tracks);
+
+    /*
+     * Не считаем успешным импорт, если VK
+     * не вернул ни одного артиста и ни одного трека.
+     */
+    if (!$artists && !$tracks) {
+        $debugMessage = '';
+
+        if (!empty($diagnostics['debug_files'])) {
+            $paths = [];
+
+            foreach ($diagnostics['debug_files'] as $file) {
+                $paths[] = $file['host'] . ': ' . $file['path'];
+            }
+
+            $debugMessage = ' Диагностические файлы: '
+                . implode(' | ', $paths);
+        }
+
+        return [
+            'ok' => false,
+            'error' => 'VK открыл плейлист, но не удалось прочитать список треков и исполнителей.' . $debugMessage,
+            'diagnostics' => $diagnostics
+        ];
+    }
+
+    return [
+        'ok' => true,
+        'title' => function_exists('mb_substr')
+            ? mb_substr($title, 0, 200, 'UTF-8')
+            : substr($title, 0, 200),
+        'artists' => array_slice($artists, 0, 80),
+        'tracks' => $tracks,
+        'cover_url' => $cover,
+        'playlist_author' => $playlistAuthor,
+        'listens' => $listens,
+        'owner_id' => $ownerId,
+        'playlist_id' => $playlistId,
+        'diagnostics' => $diagnostics
+    ];
+}
+
+/**
+ * Refreshes one external entry and appends an immutable cumulative snapshot.
+ *
+ * Логика статистики PMD сохранена без изменений.
+ */
+function nolabel_sync_release(PDO $pdo, int $id): array
+{
+    $q = $pdo->prepare(
+        'SELECT * FROM nolabel_releases WHERE id = ? LIMIT 1'
+    );
+
+    $q->execute([$id]);
+    $release = $q->fetch(PDO::FETCH_ASSOC);
+
+    if (!$release) {
+        return [
+            'ok' => false,
+            'error' => 'NoLabel-релиз не найден.'
+        ];
+    }
+
+    $stats = vk_fetch_playlist_plays(
+        (string)$release['playlist_url']
+    );
+
+    if (empty($stats['ok'])) {
+        $errorRaw = (string)($stats['error'] ?? 'Ошибка чтения VK.');
+
+        $error = function_exists('mb_substr')
+            ? mb_substr($errorRaw, 0, 500, 'UTF-8')
+            : substr($errorRaw, 0, 500);
+
+        $save = $pdo->prepare(
+            'UPDATE nolabel_releases
+             SET last_checked_at = NOW(), last_error = ?
+             WHERE id = ?'
+        );
+
+        $save->execute([$error, $id]);
+
+        return [
+            'ok' => false,
+            'error' => $error
+        ];
+    }
+
+    $plays = max(0, (int)$stats['plays']);
+
+    $pdo->beginTransaction();
+
+    try {
+        $save = $pdo->prepare(
+            'UPDATE nolabel_releases
+             SET total_plays = ?,
+                 last_checked_at = NOW(),
+                 last_success_at = NOW(),
+                 last_error = NULL
+             WHERE id = ?'
+        );
+
+        $save->execute([$plays, $id]);
+
+        $snapshot = $pdo->prepare(
+            'INSERT INTO nolabel_release_snapshots
+                (nolabel_release_id, total_plays, captured_at)
+             VALUES (?, ?, NOW())'
+        );
+
+        $snapshot->execute([$id, $plays]);
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+
+        throw $e;
+    }
+
+    return [
+        'ok' => true,
+        'plays' => $plays
+    ];
+}
