@@ -1,0 +1,163 @@
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../app/bootstrap.php';
+require_once __DIR__ . '/../app/vk_stats.php';
+require_once __DIR__ . '/../app/nolabel.php';
+
+require_role(['admin']);
+$pdo = db();
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    verify_csrf();
+    $action = (string)($_POST['action'] ?? 'add');
+
+    if ($action === 'delete') {
+        $id = (int)($_POST['id'] ?? 0);
+        if ($id > 0) {
+            $q = $pdo->prepare('DELETE FROM nolabel_releases WHERE id = ?');
+            $q->execute([$id]);
+            flash('success', 'NoLabel-релиз удалён из чарта.');
+        }
+        go('admin-nolabel.php');
+    }
+
+    $url = trim((string)($_POST['playlist_url'] ?? ''));
+    if (!vk_playlist_url_is_valid($url)) {
+        flash('error', 'Укажите корректную публичную ссылку на плейлист VK.');
+        go('admin-nolabel.php');
+    }
+
+    $meta = nolabel_vk_playlist_metadata($url);
+    if (empty($meta['ok'])) {
+        $message = (string)($meta['error'] ?? 'Не удалось прочитать данные плейлиста.');
+        $d = is_array($meta['diagnostics'] ?? null) ? $meta['diagnostics'] : [];
+        if ($d) {
+            $sections = [];
+            foreach (($d['section_attempts'] ?? []) as $a) {
+                $sections[] = ($a['host'] ?? '?') . ': HTTP ' . ($a['http'] ?? 0) . ', bytes ' . ($a['bytes'] ?? 0) . ', author blocks ' . ($a['author_blocks'] ?? 0) . ', links ' . ($a['artist_links'] ?? 0);
+            }
+            $message .= ' | Диагностика: cURL=' . (!empty($d['curl']) ? 'да' : 'нет')
+                . ', DOM=' . (!empty($d['dom']) ? 'да' : 'нет')
+                . ', страница HTTP=' . ($d['page_http'] ?? 0)
+                . ', размер=' . ($d['page_bytes'] ?? 0) . ' байт'
+                . ', заголовок=' . (!empty($d['title_found']) ? 'найден' : 'нет')
+                . ', блоков артистов=' . ($d['initial_author_blocks'] ?? 0)
+                . ', ссылок артистов=' . ($d['initial_artist_links'] ?? 0)
+                . ', JSON совпадений=' . ($d['json_artist_matches'] ?? 0)
+                . ', legacy аудио=' . ($d['legacy_audio_rows'] ?? 0)
+                . ', артистов итог=' . ($d['artists_found'] ?? 0);
+            if ($sections) $message .= ' | load_section: ' . implode(' ; ', $sections);
+        }
+        flash('error', $message);
+        go('admin-nolabel.php');
+    }
+    $stats = vk_fetch_playlist_plays($url);
+    $statsOk = !empty($stats['ok']);
+    $plays = $statsOk ? max(0, (int)$stats['plays']) : 0;
+    $statsError = $statsOk ? null : substr((string)($stats['error'] ?? 'Счётчик VK пока недоступен.'), 0, 500);
+
+    $user = current_user();
+    $artistsJson = json_encode($meta['artists'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $pdo->beginTransaction();
+    try {
+        $q = $pdo->prepare(
+            'INSERT INTO nolabel_releases
+                (playlist_url, vk_owner_id, vk_playlist_id, title, artist_names_json,
+                 cover_url, total_plays, last_checked_at, last_success_at, last_error, created_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, IF(? = 1, NOW(), NULL), IF(? = 1, NOW(), NULL), ?, ?)
+             ON DUPLICATE KEY UPDATE
+                vk_owner_id = VALUES(vk_owner_id),
+                vk_playlist_id = VALUES(vk_playlist_id),
+                title = VALUES(title),
+                artist_names_json = VALUES(artist_names_json),
+                cover_url = VALUES(cover_url),
+                total_plays = IF(VALUES(last_success_at) IS NULL, nolabel_releases.total_plays, VALUES(total_plays)),
+                last_checked_at = IF(VALUES(last_success_at) IS NULL, nolabel_releases.last_checked_at, NOW()),
+                last_success_at = IF(VALUES(last_success_at) IS NULL, nolabel_releases.last_success_at, NOW()),
+                last_error = VALUES(last_error)'
+        );
+        $q->execute([
+            $url, $meta['owner_id'], $meta['playlist_id'], $meta['title'],
+            $artistsJson, $meta['cover_url'] ?: null, $plays,
+            $statsOk ? 1 : 0, $statsOk ? 1 : 0, $statsError, (int)$user['id']
+        ]);
+        $find = $pdo->prepare('SELECT id FROM nolabel_releases WHERE playlist_url = ?');
+        $find->execute([$url]);
+        $id = (int)$find->fetchColumn();
+        $snapshot = $pdo->prepare('INSERT INTO nolabel_release_snapshots (nolabel_release_id, total_plays, captured_at) VALUES (?, ?, NOW())');
+        $snapshot->execute([$id, $plays]);
+        $pdo->commit();
+        flash(
+            $statsOk ? 'success' : 'error',
+            $statsOk
+                ? 'Плейлист добавлен в чарт NoLabel: ' . number_format($plays, 0, ',', ' ') . ' прослушиваний.'
+                : 'Плейлист добавлен в чарт NoLabel, но счётчик VK пока не прочитан. Автоматическая проверка повторится при следующем обновлении: ' . $statsError
+        );
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error_log('NoLabel playlist save: ' . $e->getMessage());
+        flash('error', 'Не удалось сохранить NoLabel-релиз. Проверьте миграцию базы данных.');
+    }
+    go('admin-nolabel.php');
+}
+
+$items = $pdo->query('SELECT * FROM nolabel_releases ORDER BY created_at DESC, id DESC')->fetchAll(PDO::FETCH_ASSOC);
+$pageTitle = 'NoLabel релиз';
+page_start($pageTitle);
+?>
+<style>
+.nl-admin{max-width:1080px;margin:0 auto;padding:30px 22px 70px;color:#f3f5f1}
+.nl-admin h1{font-size:clamp(28px,4vw,42px);margin:8px 0}
+.nl-admin .muted{color:#929b91;font-size:13px;line-height:1.6}
+.nl-admin .panel{margin:22px 0;padding:22px;border:1px solid rgba(255,255,255,.1);border-radius:18px;background:rgba(255,255,255,.025)}
+.nl-admin label{display:block;font-size:12px;font-weight:800;margin-bottom:10px}
+.nl-admin input{display:block;width:100%;margin-top:8px;padding:13px 14px;border:1px solid rgba(255,255,255,.15);border-radius:10px;background:#10150e;color:#fff;font:inherit}
+.nl-admin button,.nl-admin a.nl-btn{display:inline-flex;align-items:center;justify-content:center;padding:11px 16px;border:1px solid rgba(198,255,69,.4);border-radius:10px;background:#c6ff45;color:#10150b;font-weight:900;text-decoration:none;cursor:pointer}
+.nl-admin .nl-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 0;border-bottom:1px solid rgba(255,255,255,.08)}
+.nl-admin .nl-row:last-child{border-bottom:0}
+.nl-admin .nl-title{font-weight:900}.nl-admin .nl-artists{font-size:12px;color:#a1aa9e;margin-top:5px}
+.nl-admin .nl-delete{background:transparent;color:#ffaaaa;border-color:rgba(255,120,120,.3);padding:8px 11px}
+.nl-admin .nl-cover{width:58px;height:58px;border-radius:10px;object-fit:cover;background:#222;flex:0 0 auto}
+@media(max-width:600px){.nl-admin .nl-row{align-items:flex-start}.nl-admin .nl-delete{font-size:11px}.nl-admin .panel{padding:16px}}
+</style>
+<div class="nl-admin">
+  <a class="muted" href="admin.php">← Назад в управление релизами</a>
+  <div class="muted" style="letter-spacing:.18em;font-weight:900;margin-top:24px">CHART MANAGEMENT / PMD</div>
+  <h1>NoLabel релиз</h1>
+  <p class="muted">Добавьте публичный плейлист VK. Название, исполнители, обложка и число прослушиваний будут получены автоматически. Релиз появится в общем чарте без изменения его оформления.</p>
+  <section class="panel">
+    <form method="post" action="admin-nolabel.php">
+      <input type="hidden" name="csrf_token" value="<?=e(csrf_token())?>">
+      <input type="hidden" name="action" value="add">
+      <label>Ссылка на плейлист ВКонтакте
+        <input type="url" name="playlist_url" required maxlength="500" placeholder="https://vk.ru/music/playlist/123_456">
+      </label>
+      <button type="submit">Добавить в чарт</button>
+    </form>
+  </section>
+  <section class="panel">
+    <h2 style="margin:0 0 12px;font-size:18px">Добавленные плейлисты (<?=count($items)?>)</h2>
+    <?php if (!$items): ?><p class="muted">Пока нет NoLabel-релизов.</p><?php endif; ?>
+    <?php foreach ($items as $item): $artists = json_decode((string)$item['artist_names_json'], true) ?: []; ?>
+      <div class="nl-row">
+        <div style="display:flex;align-items:center;gap:13px;min-width:0">
+          <?php if (!empty($item['cover_url'])): ?><img class="nl-cover" src="<?=e((string)$item['cover_url'])?>" alt="" loading="lazy"><?php else: ?><div class="nl-cover" style="display:grid;place-items:center">♪</div><?php endif; ?>
+          <div style="min-width:0">
+            <div class="nl-title"><?=e((string)$item['title'])?></div>
+            <div class="nl-artists"><?=e(implode(', ', $artists))?></div>
+            <div class="muted" style="font-size:11px;margin-top:5px"><?=number_format((int)$item['total_plays'],0,',',' ')?> прослушиваний · <?=e((string)($item['last_success_at'] ?? 'ещё не обновлялся'))?></div>
+            <?php if (!empty($item['last_error'])): ?><div style="color:#ffaaaa;font-size:11px"><?=e((string)$item['last_error'])?></div><?php endif; ?>
+          </div>
+        </div>
+        <form method="post" action="admin-nolabel.php" onsubmit="return confirm('Удалить этот плейлист из чарта?')">
+          <input type="hidden" name="csrf_token" value="<?=e(csrf_token())?>">
+          <input type="hidden" name="action" value="delete">
+          <input type="hidden" name="id" value="<?=(int)$item['id']?>">
+          <button class="nl-delete" type="submit">Удалить</button>
+        </form>
+      </div>
+    <?php endforeach; ?>
+  </section>
+</div>
+<?php page_end(); ?>
