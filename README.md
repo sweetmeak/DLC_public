@@ -2414,3 +2414,223 @@ a { text-underline-offset: 3px; }
         width: auto;
     }
 }
+
+/* =========================================================
+   PMD — FIX MOBILE TOPBAR
+   Единая адаптация шапки для всех страниц
+========================================================= */
+
+.main > .topbar {
+    min-width: 0;
+}
+
+.main > .topbar > .crumb {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.main > .topbar > .user-chip {
+    display: flex !important;
+    flex: 0 1 auto !important;
+    align-items: center !important;
+    justify-content: flex-end !important;
+    flex-wrap: nowrap !important;
+    gap: 8px !important;
+    width: auto !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    height: auto !important;
+    margin: 0 !important;
+    padding: 5px 9px !important;
+    overflow: visible !important;
+    white-space: nowrap !important;
+    text-overflow: clip !important;
+    line-height: 1.2 !important;
+}
+
+.main > .topbar > .user-chip .avatar {
+    display: grid !important;
+    flex: 0 0 34px !important;
+    width: 34px !important;
+    height: 34px !important;
+    min-width: 34px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+    border-radius: 50% !important;
+    align-self: center !important;
+}
+
+.main > .topbar > .user-chip .avatar img {
+    display: block !important;
+    width: 100% !important;
+    height: 100% !important;
+    object-fit: cover !important;
+    border-radius: 50% !important;
+}
+
+.main > .topbar > .user-chip .pmd-user-name {
+    display: inline-block !important;
+    flex: 0 1 auto !important;
+    min-width: 0 !important;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    line-height: 1.2 !important;
+}
+
+.main > .topbar > .user-chip .muted {
+    display: inline !important;
+    flex: 0 0 auto !important;
+    white-space: nowrap;
+    line-height: 1.2 !important;
+}
+
+.main > .topbar .pmd-balance {
+    display: inline-flex !important;
+    flex: 0 0 auto !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 5px !important;
+    min-width: max-content !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 7px 10px !important;
+    overflow: visible !important;
+    white-space: nowrap !important;
+    line-height: 1.2 !important;
+}
+
+.main > .topbar .pmd-balance-value {
+    display: inline-block !important;
+    white-space: nowrap !important;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Планшеты */
+@media (max-width: 900px) {
+    .main > .topbar > .user-chip {
+        gap: 6px !important;
+    }
+
+    .main > .topbar > .user-chip .pmd-user-name {
+        max-width: 125px;
+    }
+}
+
+/* Телефоны */
+@media (max-width: 700px) {
+    .main > .topbar {
+        justify-content: space-between !important;
+        gap: 6px !important;
+        padding-left: 10px !important;
+        padding-right: 10px !important;
+    }
+
+    .main > .topbar > .crumb {
+        flex: 1 1 0 !important;
+        max-width: none !important;
+        font-size: 8px !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+    }
+
+    .main > .topbar > .user-chip {
+        flex: 0 1 auto !important;
+        gap: 5px !important;
+        max-width: calc(100vw - 115px) !important;
+        padding: 4px 6px !important;
+        border-radius: 24px !important;
+        font-size: 10px !important;
+    }
+
+    .main > .topbar > .user-chip .avatar {
+        flex: 0 0 30px !important;
+        width: 30px !important;
+        height: 30px !important;
+        min-width: 30px !important;
+    }
+
+    .main > .topbar > .user-chip .pmd-user-name {
+        max-width: clamp(42px, 19vw, 100px) !important;
+        font-size: 10px !important;
+    }
+
+    .main > .topbar > .user-chip .muted {
+        display: none !important;
+    }
+
+    .main > .topbar .pmd-balance {
+        gap: 3px !important;
+        padding: 6px 7px !important;
+        font-size: 10px !important;
+    }
+
+    .main > .topbar .pmd-balance-icon {
+        font-size: 11px !important;
+    }
+
+    .main > .topbar .pmd-balance-value {
+        font-size: 10px !important;
+    }
+}
+
+/* Очень узкие телефоны */
+@media (max-width: 360px) {
+    .main > .topbar {
+        gap: 4px !important;
+        padding-left: 7px !important;
+        padding-right: 7px !important;
+    }
+
+    .main > .topbar > .user-chip {
+        gap: 4px !important;
+        max-width: calc(100vw - 95px) !important;
+    }
+
+    .main > .topbar > .user-chip .avatar {
+        flex-basis: 27px !important;
+        width: 27px !important;
+        height: 27px !important;
+        min-width: 27px !important;
+    }
+
+    .main > .topbar > .user-chip .pmd-user-name {
+        max-width: 48px !important;
+    }
+
+    .main > .topbar .pmd-balance {
+        padding: 5px 6px !important;
+        font-size: 9px !important;
+    }
+
+    .main > .topbar .pmd-balance-value {
+        font-size: 9px !important;
+    }
+}
+/* Центрирование ника артиста относительно аватарки */
+@media (min-width: 601px) {
+    .topbar .user-chip .pmd-user-name {
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        align-self: center !important;
+
+        height: 100% !important;
+        line-height: normal !important;
+
+        margin: 0 !important;
+        padding: 0 !important;
+
+        position: relative !important;
+        top: 0 !important;
+        transform: none !important;
+    }
+
+    .topbar .user-chip {
+        display: flex !important;
+        align-items: center !important;
+    }
+}
