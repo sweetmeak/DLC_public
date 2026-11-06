@@ -1,0 +1,1105 @@
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../app/bootstrap.php';
+require_once __DIR__ . '/../app/release_artists.php';
+
+$pdo = db();
+date_default_timezone_set('Europe/Moscow');
+
+// Текущий пользователь. Для гостей ID будет равен 0.
+$currentUser = current_user();
+$currentUserId = (int)($currentUser['id'] ?? $currentUser['user_id'] ?? 0);
+
+$period = (string)($_GET['period'] ?? '7');
+
+if (!in_array($period, ['7', '30', 'all'], true)) {
+    $period = '7';
+}
+
+$today = new DateTimeImmutable('today');
+$days = $period === '30' ? 30 : 7;
+
+if ($period !== 'all') {
+    $currentStart = $today->modify('-' . ($days - 1) . ' days')->format('Y-m-d');
+    $previousStart = $today->modify('-' . (($days * 2) - 1) . ' days')->format('Y-m-d');
+    $previousEnd = $today->modify('-' . $days . ' days')->format('Y-m-d');
+} else {
+    $currentStart = $previousStart = $previousEnd = '';
+}
+
+/*
+ * Получаем релизы, для которых подключена статистика VK.
+ * user_id нужен для определения релизов текущего пользователя.
+ */
+$sql = "
+    SELECT
+        r.id,
+        r.user_id,
+        r.title,
+        r.main_artist,
+        r.metadata_json,
+        r.cover_path,
+        s.playlist_url,
+        s.last_total_plays
+    FROM releases r
+    INNER JOIN release_stats_sources s ON s.release_id = r.id
+    WHERE r.status = 'loaded'
+    ORDER BY r.id DESC
+    LIMIT 500
+";
+
+$releases = $pdo->query($sql)->fetchAll();
+
+// Подтягиваем участников с ролью feat. из метаданных каждого трека.
+$artistTracks = [];
+if ($releases) {
+    $releaseIds = array_values(array_unique(array_map(static fn($row) => (int)$row['id'], $releases)));
+    $marks = implode(',', array_fill(0, count($releaseIds), '?'));
+    $trackStmt = $pdo->prepare("SELECT release_id, track_json FROM release_tracks WHERE release_id IN ($marks) ORDER BY release_id, track_no");
+    $trackStmt->execute($releaseIds);
+    foreach ($trackStmt->fetchAll(PDO::FETCH_ASSOC) as $trackRow) {
+        $artistTracks[(int)$trackRow['release_id']][] = $trackRow;
+    }
+}
+
+$daily = [];
+
+if ($period !== 'all' && $releases) {
+    $dailySql = "
+        SELECT release_id, stat_date, chart_plays, captured_at
+        FROM release_stats_daily_snapshots
+        WHERE stat_date >= :start_date
+          AND stat_date <= :end_date
+        ORDER BY release_id, stat_date, captured_at
+    ";
+
+    $stmt = $pdo->prepare($dailySql);
+
+    $stmt->execute([
+        ':start_date' => $previousStart,
+        ':end_date' => $today->format('Y-m-d'),
+    ]);
+
+    foreach ($stmt->fetchAll() as $row) {
+        $rid = (int)$row['release_id'];
+        $date = (string)$row['stat_date'];
+        $daily[$rid][$date] = (int)$row['chart_plays'];
+    }
+}
+
+/*
+ * Последние значения общего счётчика VK.
+ */
+$allTime = [];
+
+if ($releases) {
+    $snapshotSql = "
+        SELECT s1.release_id, s1.total_plays, s1.captured_at
+        FROM release_stats_snapshots s1
+        INNER JOIN (
+            SELECT release_id, MAX(captured_at) AS latest_at
+            FROM release_stats_snapshots
+            GROUP BY release_id
+        ) latest
+            ON latest.release_id = s1.release_id
+           AND latest.latest_at = s1.captured_at
+    ";
+
+    foreach ($pdo->query($snapshotSql)->fetchAll() as $row) {
+        $rid = (int)$row['release_id'];
+
+        $allTime[$rid] = [
+            'total' => (int)$row['total_plays'],
+            'captured_at' => (string)$row['captured_at'],
+        ];
+    }
+}
+
+/*
+ * Предыдущее значение общего счётчика.
+ */
+$previousAllTime = [];
+
+if ($period === 'all' && $releases) {
+    $previousSql = "
+        SELECT current_row.release_id, previous_row.total_plays
+        FROM release_stats_snapshots current_row
+        INNER JOIN (
+            SELECT release_id, MAX(captured_at) AS latest_at
+            FROM release_stats_snapshots
+            GROUP BY release_id
+        ) latest
+            ON latest.release_id = current_row.release_id
+           AND latest.latest_at = current_row.captured_at
+        LEFT JOIN release_stats_snapshots previous_row
+            ON previous_row.release_id = current_row.release_id
+           AND previous_row.captured_at < current_row.captured_at
+           AND previous_row.captured_at = (
+                SELECT MAX(p2.captured_at)
+                FROM release_stats_snapshots p2
+                WHERE p2.release_id = current_row.release_id
+                  AND p2.captured_at < current_row.captured_at
+           )
+    ";
+
+    foreach ($pdo->query($previousSql)->fetchAll() as $row) {
+        if ($row['total_plays'] !== null) {
+            $previousAllTime[(int)$row['release_id']] = (int)$row['total_plays'];
+        }
+    }
+}
+
+/*
+ * Формируем рейтинг.
+ */
+$chart = [];
+
+foreach ($releases as $release) {
+    $id = (int)$release['id'];
+
+    $total = $allTime[$id]['total']
+        ?? (int)($release['last_total_plays'] ?? 0);
+
+    if ($period === 'all') {
+        $plays = $total;
+        $previous = $previousAllTime[$id] ?? null;
+    } else {
+        $plays = 0;
+        $previous = 0;
+
+        foreach (($daily[$id] ?? []) as $date => $value) {
+            if ($date >= $currentStart && $date <= $today->format('Y-m-d')) {
+                $plays += $value;
+            } elseif ($date >= $previousStart && $date <= $previousEnd) {
+                $previous += $value;
+            }
+        }
+
+        if ($previous === 0) {
+            $previous = null;
+        }
+    }
+
+    $growth = null;
+
+    if ($previous !== null && $previous > 0) {
+        $growth = (($plays - $previous) / $previous) * 100;
+    }
+
+    $metadata = json_decode((string)($release['metadata_json'] ?? '{}'), true) ?: [];
+    $release['artist_display'] = pmd_release_artist_display(
+        $metadata,
+        $artistTracks[$id] ?? []
+    );
+
+    $release['chart_plays'] = $plays;
+    $release['growth'] = $growth;
+    $release['all_time_plays'] = $total;
+
+    // Отмечаем релизы, принадлежащие текущему пользователю.
+    $release['is_own'] = (
+        $currentUserId > 0 &&
+        (int)$release['user_id'] === $currentUserId
+    );
+
+    $chart[] = $release;
+}
+
+/*
+ * Внешние NoLabel-плейлисты — отдельная сущность, но отображаются
+ * в том же массиве рейтинга и используют те же шаблоны/классы.
+ * Они не проходят через release_stats_reward_state и не влияют
+ * на выплаты владельцам релизов PMD.
+ */
+$noLabelRows = $pdo->query('SELECT * FROM nolabel_releases ORDER BY id DESC LIMIT 500')->fetchAll(PDO::FETCH_ASSOC);
+if ($noLabelRows) {
+    $noLabelIds = array_map(static fn($row) => (int)$row['id'], $noLabelRows);
+    $marks = implode(',', array_fill(0, count($noLabelIds), '?'));
+    $snapStmt = $pdo->prepare(
+        "SELECT nolabel_release_id, total_plays, captured_at
+         FROM nolabel_release_snapshots
+         WHERE nolabel_release_id IN ($marks)
+         ORDER BY nolabel_release_id ASC, captured_at ASC, id ASC"
+    );
+    $snapStmt->execute($noLabelIds);
+    $noLabelSnapshots = [];
+    foreach ($snapStmt->fetchAll(PDO::FETCH_ASSOC) as $snap) {
+        $noLabelSnapshots[(int)$snap['nolabel_release_id']][] = [
+            'total' => (int)$snap['total_plays'],
+            'at' => (string)$snap['captured_at'],
+            'date' => substr((string)$snap['captured_at'], 0, 10),
+        ];
+    }
+
+    $deltaForPeriod = static function (array $snaps, string $start, string $end): int {
+        $baseline = null;
+        $endValue = null;
+        $firstInPeriod = null;
+        foreach ($snaps as $snap) {
+            if ($snap['date'] < $start) {
+                $baseline = (int)$snap['total'];
+                continue;
+            }
+            if ($snap['date'] <= $end) {
+                if ($firstInPeriod === null) $firstInPeriod = (int)$snap['total'];
+                $endValue = (int)$snap['total'];
+            }
+        }
+        if ($endValue === null) return 0;
+        if ($baseline === null) $baseline = $firstInPeriod ?? $endValue;
+        return max(0, $endValue - $baseline);
+    };
+
+    foreach ($noLabelRows as $external) {
+        $externalId = (int)$external['id'];
+        $snaps = $noLabelSnapshots[$externalId] ?? [];
+        $total = (int)$external['total_plays'];
+        $previous = null;
+        if ($period === 'all') {
+            $plays = $total;
+            if (count($snaps) >= 2) $previous = (int)$snaps[count($snaps) - 2]['total'];
+        } else {
+            $todayString = $today->format('Y-m-d');
+            $plays = $deltaForPeriod($snaps, $currentStart, $todayString);
+            $previousValue = $deltaForPeriod($snaps, $previousStart, $previousEnd);
+            $previous = $previousValue > 0 ? $previousValue : null;
+        }
+        $growth = null;
+        if ($previous !== null && $previous > 0) {
+            $growth = (($plays - $previous) / $previous) * 100;
+        }
+        $artists = json_decode((string)($external['artist_names_json'] ?? '[]'), true);
+        if (!is_array($artists)) $artists = [];
+        $artists = array_values(array_unique(array_filter(array_map(
+            static fn($name) => trim((string)$name),
+            $artists
+        ), static fn($name) => $name !== '')));
+        $artistDisplay = $artists ? implode(', ', $artists) : 'Исполнитель';
+        $chart[] = [
+            'id' => -$externalId,
+            'user_id' => 0,
+            'title' => (string)$external['title'],
+            'main_artist' => $artistDisplay,
+            'artist_display' => $artistDisplay,
+            'cover_path' => (string)($external['cover_url'] ?? ''),
+            'chart_plays' => $plays,
+            'growth' => $growth,
+            'all_time_plays' => $total,
+            'is_own' => false,
+            'is_nolabel' => true,
+            'playlist_url' => (string)$external['playlist_url'],
+        ];
+    }
+}
+
+usort($chart, static function (array $a, array $b): int {
+    $comparison = (int)$b['chart_plays'] <=> (int)$a['chart_plays'];
+
+    return $comparison !== 0
+        ? $comparison
+        : ((int)$a['id'] <=> (int)$b['id']);
+});
+
+$chart = array_slice($chart, 0, 500);
+
+/**
+ * Подготовка пути к обложке.
+ *
+ * Поддерживает:
+ * https://site.ru/image.jpg
+ * /uploads/covers/image.jpg
+ * uploads/covers/image.jpg
+ */
+function chart_cover(?string $path): string {
+    return pmd_media_url($path, 'cover');
+}
+
+/**
+ * Форматирование динамики.
+ */
+function chart_growth(?float $growth): string {
+    if ($growth === null) {
+        return '—';
+    }
+
+    $prefix = $growth > 0 ? '+' : '';
+
+    return $prefix . number_format($growth, 1, ',', ' ') . '%';
+}
+
+$pageTitle = 'Чарт релизов';
+
+page_start($pageTitle);
+
+?>
+
+<style>
+.chart-page {
+    width: 100%;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 36px 32px 70px;
+    color: #f4f7f6;
+    font-family: Manrope, sans-serif;
+}
+
+.chart-page *,
+.chart-page *::before,
+.chart-page *::after {
+    box-sizing: border-box;
+}
+
+.chart-page a {
+    color: inherit;
+    text-decoration: none;
+}
+
+.chart-page .chart-heading {
+    margin-bottom: 34px;
+    text-align: center;
+}
+
+.chart-page .eyebrow {
+    color: #b8f36a;
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: .25em;
+    text-transform: uppercase;
+}
+
+.chart-page h1 {
+    margin: 12px 0 9px;
+    color: #f4f7f6;
+    font-size: clamp(34px, 6vw, 58px);
+    line-height: 1.05;
+    letter-spacing: -.065em;
+    font-weight: 900;
+}
+
+.chart-page .subtitle {
+    margin: 0;
+    color: #87918f;
+    font-size: 13px;
+}
+
+.chart-page .periods {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin: 30px 0 48px;
+}
+
+.chart-page .period {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 11px 19px;
+    border: 1px solid rgba(255,255,255,.075);
+    border-radius: 12px;
+    background: rgba(255,255,255,.025);
+    color: #aab3b0;
+    font: 800 11px Manrope, sans-serif;
+    cursor: pointer;
+    transition: .2s;
+}
+
+.chart-page .period:hover {
+    border-color: rgba(184,243,106,.35);
+    color: #fff;
+}
+
+.chart-page .period.active {
+    color: #11160b;
+    background: #b8f36a;
+    border-color: #b8f36a;
+}
+
+.chart-page .podium {
+    display: grid;
+    grid-template-columns: 1fr 1.08fr 1fr;
+    gap: 18px;
+    align-items: end;
+    max-width: 880px;
+    margin: 0 auto 52px;
+}
+
+.chart-page .podium-card {
+    position: relative;
+    min-width: 0;
+    overflow: hidden;
+    text-align: center;
+    border: 1px solid rgba(255,255,255,.075);
+    border-radius: 22px;
+    background: linear-gradient(160deg, rgba(255,255,255,.055), rgba(255,255,255,.012));
+    padding: 25px 18px 23px;
+    animation: chartRise .7s both;
+}
+
+.chart-page .podium-card.first {
+    min-height: 330px;
+    padding-top: 30px;
+    border-color: rgba(255,213,100,.32);
+    background: linear-gradient(160deg, rgba(255,204,82,.13), rgba(255,255,255,.018) 65%);
+    box-shadow: 0 18px 65px rgba(0,0,0,.28), 0 0 45px rgba(255,194,62,.06);
+}
+
+.chart-page .podium-card.second {
+    min-height: 285px;
+    animation-delay: .08s;
+}
+
+.chart-page .podium-card.third {
+    min-height: 265px;
+    animation-delay: .16s;
+}
+
+@keyframes chartRise {
+    from { opacity: 0; transform: translateY(18px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.chart-page .place {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 16px;
+    color: #d4d9d6;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: .17em;
+    text-transform: uppercase;
+}
+
+.chart-page .trophy {
+    display: inline-block;
+    font-size: 27px;
+    filter: drop-shadow(0 5px 12px rgba(0,0,0,.3));
+}
+
+.chart-page .first .trophy {
+    font-size: 38px;
+    animation: chartGoldPulse 2.4s ease-in-out infinite;
+}
+
+.chart-page .second .trophy {
+    animation: chartSilverFloat 3.2s ease-in-out infinite;
+}
+
+.chart-page .third .trophy {
+    animation: chartBronzeFloat 4s ease-in-out infinite;
+}
+
+@keyframes chartGoldPulse {
+    0%, 100% { transform: translateY(0) scale(1); filter: drop-shadow(0 0 8px rgba(255,204,75,.28)); }
+    50% { transform: translateY(-5px) scale(1.09); filter: drop-shadow(0 0 17px rgba(255,204,75,.55)); }
+}
+
+@keyframes chartSilverFloat {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-4px); }
+}
+
+@keyframes chartBronzeFloat {
+    0%, 100% { transform: rotate(0); }
+    50% { transform: rotate(4deg) translateY(-2px); }
+}
+
+.chart-page .cover {
+    width: 112px;
+    height: 112px;
+    display: block;
+    margin: 0 auto 16px;
+    border-radius: 17px;
+    object-fit: cover;
+    background: #222a2b;
+    box-shadow: 0 10px 30px rgba(0,0,0,.35);
+}
+
+.chart-page .first .cover {
+    width: 132px;
+    height: 132px;
+    border-radius: 20px;
+}
+
+.chart-page .cover-empty {
+    display: grid;
+    place-items: center;
+    color: #66716c;
+    font-size: 32px;
+}
+
+.chart-page .release-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #f4f7f6;
+    font-size: 14px;
+    font-weight: 900;
+}
+
+.chart-page .first .release-title {
+    font-size: 16px;
+}
+
+.chart-page .artist {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 5px;
+    color: #87918f;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.chart-page .artist-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chart-page .artist-name.nolabel-artists,
+.chart-page .rank-artist-name.nolabel-artists {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.chart-page .rank-artist {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+    color: #87918f;
+    font-size: 10px;
+}
+
+.chart-page .rank-artist-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chart-page .you-badge {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    padding: 3px 7px;
+    border: 1px solid rgba(184,243,106,.24);
+    border-radius: 6px;
+    background: rgba(184,243,106,.11);
+    color: #b8f36a;
+    font-size: 8px;
+    line-height: 1.2;
+    font-weight: 900;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.chart-page .plays {
+    margin-top: 17px;
+    color: #fff;
+    font-size: 22px;
+    font-weight: 900;
+    letter-spacing: -.04em;
+}
+
+.chart-page .plays-label {
+    margin-top: 2px;
+    color: #77817e;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+}
+
+.chart-page .growth {
+    display: inline-flex;
+    margin-top: 12px;
+    padding: 6px 9px;
+    border-radius: 8px;
+    background: rgba(184,243,106,.09);
+    color: #b8f36a;
+    font-size: 10px;
+    font-weight: 900;
+}
+
+.chart-page .growth.down {
+    background: rgba(255,112,112,.09);
+    color: #ff8989;
+}
+
+.chart-page .list-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 15px;
+}
+
+.chart-page .list-head h2 {
+    margin: 0;
+    color: #f4f7f6;
+    font-size: 15px;
+    font-weight: 900;
+    letter-spacing: -.02em;
+}
+
+.chart-page .list-head span {
+    color: #87918f;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+}
+
+.chart-page .ranking {
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,.075);
+    border-radius: 18px;
+    background: rgba(255,255,255,.018);
+}
+
+.chart-page .rank-row {
+    display: grid;
+    grid-template-columns: 44px 52px minmax(0,1fr) 150px 90px;
+    align-items: center;
+    gap: 15px;
+    padding: 13px 19px;
+    border-bottom: 1px solid rgba(255,255,255,.075);
+    transition: background .2s;
+}
+
+.chart-page .rank-row:last-child {
+    border-bottom: 0;
+}
+
+.chart-page .rank-row:hover {
+    background: rgba(255,255,255,.035);
+}
+
+.chart-page .rank-number {
+    color: #7e8985;
+    font-size: 12px;
+    font-weight: 900;
+    text-align: center;
+}
+
+.chart-page .rank-cover {
+    width: 48px;
+    height: 48px;
+    border-radius: 10px;
+    object-fit: cover;
+    background: #222a2b;
+}
+
+.chart-page .rank-info {
+    min-width: 0;
+}
+
+.chart-page .rank-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #f4f7f6;
+    font-size: 12px;
+    font-weight: 900;
+}
+
+.chart-page .rank-plays {
+    color: #f4f7f6;
+    text-align: right;
+    font-size: 12px;
+    font-weight: 900;
+}
+
+.chart-page .rank-growth {
+    color: #b8f36a;
+    text-align: right;
+    font-size: 10px;
+    font-weight: 900;
+}
+
+.chart-page .rank-growth.down {
+    color: #ff8989;
+}
+
+.chart-page .empty {
+    padding: 48px 20px;
+    color: #87918f;
+    text-align: center;
+    font-size: 13px;
+}
+
+.chart-page .footer {
+    margin-top: 24px;
+    color: #5f6965;
+    text-align: center;
+    font-size: 10px;
+}
+
+@media (max-width: 1050px) {
+    .chart-page {
+        padding-right: 24px;
+        padding-left: 24px;
+    }
+}
+
+@media (max-width: 700px) {
+    .chart-page {
+        width: 100%;
+        padding: 25px 14px 35px;
+    }
+
+    .chart-page .chart-heading {
+        margin-bottom: 25px;
+    }
+
+    .chart-page .podium {
+        gap: 8px;
+        margin-bottom: 35px;
+    }
+
+    .chart-page .podium-card {
+        padding: 17px 8px;
+        border-radius: 16px;
+    }
+
+    .chart-page .podium-card.first { min-height: 270px; }
+    .chart-page .podium-card.second { min-height: 240px; }
+    .chart-page .podium-card.third { min-height: 225px; }
+
+    .chart-page .cover {
+        width: 76px;
+        height: 76px;
+        border-radius: 12px;
+    }
+
+    .chart-page .first .cover {
+        width: 94px;
+        height: 94px;
+    }
+
+    .chart-page .trophy { font-size: 21px; }
+    .chart-page .first .trophy { font-size: 30px; }
+
+    .chart-page .release-title,
+    .chart-page .first .release-title {
+        font-size: 11px;
+    }
+
+    .chart-page .artist {
+        font-size: 9px;
+    }
+
+    .chart-page .plays { font-size: 17px; }
+
+    .chart-page .periods {
+        margin: 24px 0 32px;
+    }
+
+    .chart-page .period {
+        padding: 10px 12px;
+        font-size: 10px;
+    }
+
+    .chart-page .rank-row {
+        grid-template-columns: 28px 42px minmax(0,1fr) 82px;
+        gap: 9px;
+        padding: 11px 9px;
+    }
+
+    .chart-page .rank-cover {
+        width: 40px;
+        height: 40px;
+    }
+
+    .chart-page .rank-plays { font-size: 10px; }
+    .chart-page .rank-growth { display: none; }
+
+    .chart-page .rank-artist {
+        font-size: 9px;
+    }
+}
+
+@media (max-width: 380px) {
+    .chart-page .podium { gap: 5px; }
+
+    .chart-page .podium-card {
+        padding-right: 5px;
+        padding-left: 5px;
+    }
+
+    .chart-page .place {
+        gap: 4px;
+        font-size: 8px;
+        letter-spacing: .08em;
+    }
+
+    .chart-page .plays { font-size: 15px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .chart-page *,
+    .chart-page *::before,
+    .chart-page *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+    }
+}
+</style>
+
+<div class="chart-page">
+
+    <header class="chart-heading">
+        <div class="eyebrow">PMD · OFFICIAL CHART</div>
+        <h1>Топ релизов</h1>
+        <p class="subtitle">Самые прослушиваемые релизы артистов PMD</p>
+    </header>
+
+    <nav class="periods" aria-label="Период чарта">
+        <a class="period <?= $period === '7' ? 'active' : '' ?>" href="?period=7">7 дней</a>
+        <a class="period <?= $period === '30' ? 'active' : '' ?>" href="?period=30">30 дней</a>
+        <a class="period <?= $period === 'all' ? 'active' : '' ?>" href="?period=all">Всё время</a>
+    </nav>
+
+    <?php if (count($chart) >= 1): ?>
+
+        <?php
+        $podium = array_slice($chart, 0, 3);
+        $podiumOrder = [];
+
+        if (isset($podium[1])) {
+            $podiumOrder[] = [1, 'second', '🥈', '2 место'];
+        }
+
+        if (isset($podium[0])) {
+            $podiumOrder[] = [0, 'first', '🏆', '1 место'];
+        }
+
+        if (isset($podium[2])) {
+            $podiumOrder[] = [2, 'third', '🥉', '3 место'];
+        }
+        ?>
+
+        <section class="podium" aria-label="Тройка лидеров">
+
+            <?php foreach ($podiumOrder as [$index, $class, $trophy, $label]): ?>
+                <?php
+                $item = $podium[$index];
+                $cover = chart_cover($item['cover_path'] ?? '');
+                ?>
+
+                <article class="podium-card <?= e($class) ?>">
+
+                    <div class="place">
+                        <span class="trophy"><?= $trophy ?></span>
+                        <?= e($label) ?>
+                    </div>
+
+                    <?php if ($cover !== ''): ?>
+                        <img
+                            class="cover"
+                            src="<?= e($cover) ?>"
+                            alt=""
+                            loading="lazy"
+                            onerror="this.style.display='none';this.nextElementSibling.style.display='grid';"
+                        >
+                        <div class="cover cover-empty" style="display:none;">♪</div>
+                    <?php else: ?>
+                        <div class="cover cover-empty">♪</div>
+                    <?php endif; ?>
+
+                    <div class="release-title" title="<?= e((string)$item['title']) ?>">
+                        <?= e((string)$item['title']) ?>
+                    </div>
+
+                    <div class="artist">
+                        <span class="artist-name <?= !empty($item['is_nolabel']) ? 'nolabel-artists' : '' ?>" title="<?= e((string)($item['artist_display'] ?? $item['main_artist'])) ?>">
+                            <?= e((string)($item['artist_display'] ?? $item['main_artist'])) ?>
+                        </span>
+
+                        <?php if (!empty($item['is_own'])): ?>
+                            <span class="you-badge">Это вы</span>
+                        <?php endif; ?>
+                    </div>
+
+                    <div class="plays">
+                        <?= number_format((int)$item['chart_plays'], 0, ',', ' ') ?>
+                    </div>
+
+                    <div class="plays-label">прослушиваний</div>
+
+                    <?php if ($item['growth'] !== null): ?>
+                        <div class="growth <?= $item['growth'] < 0 ? 'down' : '' ?>">
+                            <?= e(chart_growth((float)$item['growth'])) ?>
+                        </div>
+                    <?php else: ?>
+                        <div class="growth">—</div>
+                    <?php endif; ?>
+
+                </article>
+            <?php endforeach; ?>
+
+        </section>
+
+    <?php endif; ?>
+
+    <div class="list-head">
+        <h2>Рейтинг релизов</h2>
+        <span>ТОП <?= count($chart) ?> · PMD</span>
+    </div>
+
+    <section class="ranking">
+
+        <?php if (!$chart): ?>
+            <div class="empty">
+                Пока нет релизов с подключённой статистикой VK.
+            </div>
+        <?php else: ?>
+
+            <?php foreach (array_slice($chart, 3) as $index => $item): ?>
+                <?php $cover = chart_cover($item['cover_path'] ?? ''); ?>
+
+                <article class="rank-row">
+
+                    <div class="rank-number"><?= $index + 4 ?></div>
+
+                    <?php if ($cover !== ''): ?>
+                        <img
+                            class="rank-cover"
+                            src="<?= e($cover) ?>"
+                            alt=""
+                            loading="lazy"
+                            onerror="this.style.display='none';this.nextElementSibling.style.display='grid';"
+                        >
+                        <div class="rank-cover cover-empty" style="display:none;">♪</div>
+                    <?php else: ?>
+                        <div class="rank-cover cover-empty">♪</div>
+                    <?php endif; ?>
+
+                    <div class="rank-info">
+
+                        <div class="rank-title" title="<?= e((string)$item['title']) ?>">
+                            <?= e((string)$item['title']) ?>
+                        </div>
+
+                        <div class="rank-artist">
+                            <span class="rank-artist-name <?= !empty($item['is_nolabel']) ? 'nolabel-artists' : '' ?>" title="<?= e((string)($item['artist_display'] ?? $item['main_artist'])) ?>">
+                                <?= e((string)($item['artist_display'] ?? $item['main_artist'])) ?>
+                            </span>
+
+                            <?php if (!empty($item['is_own'])): ?>
+                                <span class="you-badge">Это вы</span>
+                            <?php endif; ?>
+                        </div>
+
+                    </div>
+
+                    <div class="rank-plays">
+                        <?= number_format((int)$item['chart_plays'], 0, ',', ' ') ?>
+                    </div>
+
+                    <div class="rank-growth <?= ($item['growth'] ?? 0) < 0 ? 'down' : '' ?>">
+                        <?= e(chart_growth(
+                            $item['growth'] !== null
+                                ? (float)$item['growth']
+                                : null
+                        )) ?>
+                    </div>
+
+                </article>
+            <?php endforeach; ?>
+
+        <?php endif; ?>
+
+    </section>
+
+    <div class="footer">
+        Данные чарта формируются на основе статистики VK · PLAYERS MUSIC DISTRIBUTION
+    </div>
+
+</div>
+
+<script>
+(function () {
+    // Per-account NoLabel refresh: at most once every five minutes.
+    fetch('nolabel-chart-refresh.php', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'csrf_token=' + encodeURIComponent('<?=e(csrf_token())?>'),
+        cache: 'no-store'
+    }).catch(function (error) {
+        console.warn('PMD NoLabel refresh:', error);
+    });
+
+    let stopped = false;
+    let action = 'start';
+    let timer = null;
+
+    async function runChartQueue() {
+        if (stopped) {
+            return;
+        }
+
+        try {
+            const response = await fetch('chart-refresh-worker.php', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                body: 'action=' + encodeURIComponent(action),
+                cache: 'no-store'
+            });
+
+            if (!response.ok) {
+                throw new Error('HTTP ' + response.status);
+            }
+
+            const data = await response.json();
+
+            if (!data.ok) {
+                throw new Error(data.error || 'Ошибка очереди');
+            }
+
+            action = 'work';
+
+            if (data.finished || Number(data.pending) === 0) {
+                stopped = true;
+                return;
+            }
+
+            timer = setTimeout(runChartQueue, 5000);
+
+        } catch (error) {
+            console.error('PMD chart refresh:', error);
+
+            timer = setTimeout(runChartQueue, 10000);
+        }
+    }
+
+    runChartQueue();
+
+    window.addEventListener('pagehide', function () {
+        stopped = true;
+
+        if (timer !== null) {
+            clearTimeout(timer);
+        }
+    });
+})();
+</script>
+
+<?php page_end(); ?>
