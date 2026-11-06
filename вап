@@ -1,0 +1,677 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * Сохраняет диагностический ответ VK в app/nolabel_debug.
+ * Файлы имеют PHP-защиту: при прямом открытии через браузер
+ * их содержимое не отображается.
+ */
+function nolabel_vk_save_debug_response(string $host, string $response): ?string
+{
+    if ($response === '') {
+        return null;
+    }
+
+    $directory = __DIR__ . DIRECTORY_SEPARATOR . 'nolabel_debug';
+
+    if (!is_dir($directory)) {
+        if (!@mkdir($directory, 0755, true) && !is_dir($directory)) {
+            return null;
+        }
+    }
+
+    if (!is_writable($directory)) {
+        return null;
+    }
+
+    $index = $directory . DIRECTORY_SEPARATOR . 'index.php';
+
+    if (!is_file($index)) {
+        @file_put_contents(
+            $index,
+            "<?php http_response_code(404); exit;\n"
+        );
+    }
+
+    $hostPrefix = preg_replace('/[^a-z0-9_-]/i', '', $host);
+
+    try {
+        $filename = 'vk_' . $hostPrefix . '_' . bin2hex(random_bytes(12)) . '.txt.php';
+    } catch (Throwable $e) {
+        return null;
+    }
+
+    $filePath = $directory . DIRECTORY_SEPARATOR . $filename;
+
+    // Файл не выдаст содержимое при прямом открытии через браузер.
+    $protectedResponse = "<?php http_response_code(404); exit; __halt_compiler(); ?>\n"
+        . $response;
+
+    $written = @file_put_contents(
+        $filePath,
+        $protectedResponse,
+        LOCK_EX
+    );
+
+    if ($written === false) {
+        return null;
+    }
+
+    @chmod($filePath, 0600);
+
+    return $filePath;
+}
+
+/**
+ * Reads public playlist metadata from VK.
+ * Does not modify the PMD statistics or reward pipeline.
+ */
+function nolabel_vk_playlist_metadata(string $url): array
+{
+    if (!vk_playlist_url_is_valid($url)) {
+        return [
+            'ok' => false,
+            'error' => 'Некорректная ссылка на плейлист VK.'
+        ];
+    }
+
+    if (!function_exists('curl_init')) {
+        return [
+            'ok' => false,
+            'error' => 'На сервере не включено PHP-расширение cURL.'
+        ];
+    }
+
+    $parts = parse_url($url);
+    $path = (string)($parts['path'] ?? '');
+
+    $ownerId = null;
+    $playlistId = null;
+    $accessKey = '';
+
+    if (preg_match('~^/music/playlist/(-?\d+)_(\d+)(?:_([a-f0-9]+))?/?$~i', $path, $m)) {
+        $ownerId = (int)$m[1];
+        $playlistId = (int)$m[2];
+        $accessKey = $m[3] ?? '';
+    }
+
+    $diagnostics = [
+        'curl' => true,
+        'dom' => class_exists('DOMDocument'),
+        'page_http' => 0,
+        'page_bytes' => 0,
+        'title_found' => false,
+        'initial_author_blocks' => 0,
+        'initial_artist_links' => 0,
+        'json_artist_matches' => 0,
+        'legacy_audio_rows' => 0,
+        'artists_found' => 0,
+        'section_attempts' => [],
+        'debug_files' => []
+    ];
+
+    $ch = curl_init($url);
+
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_ENCODING => '',
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36',
+        CURLOPT_HTTPHEADER => [
+            'Accept-Language: ru-RU,ru;q=0.9,en;q=0.7'
+        ],
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+    ]);
+
+    $html = curl_exec($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $diagnostics['page_http'] = $status;
+    $diagnostics['page_bytes'] = is_string($html) ? strlen($html) : 0;
+
+    if (!is_string($html) || $html === '' || $status < 200 || $status >= 300) {
+        return [
+            'ok' => false,
+            'error' => 'VK не отдал страницу плейлиста (HTTP ' . $status . ').',
+            'diagnostics' => $diagnostics
+        ];
+    }
+
+    $decode = static function (string $value): string {
+        $value = html_entity_decode(
+            $value,
+            ENT_QUOTES | ENT_HTML5,
+            'UTF-8'
+        );
+
+        $value = strip_tags($value);
+
+        return trim(preg_replace('/\s+/u', ' ', $value) ?? $value);
+    };
+
+    $title = '';
+    $cover = '';
+
+    if (class_exists('DOMDocument')) {
+        $previousLibxml = libxml_use_internal_errors(true);
+        $dom = new DOMDocument();
+
+        if ($dom->loadHTML('<?xml encoding="UTF-8">' . $html)) {
+            $xpath = new DOMXPath($dom);
+            $titleNodes = $xpath->query('//*[@data-testid="MusicPlaylistPage_Title"]');
+
+            if ($titleNodes && $titleNodes->length > 0) {
+                $candidateTitle = $decode(
+                    (string)$dom->saveHTML($titleNodes->item(0))
+                );
+
+                if ($candidateTitle !== '') {
+                    $title = $candidateTitle;
+                }
+            }
+        }
+
+        libxml_clear_errors();
+        libxml_use_internal_errors($previousLibxml);
+    }
+
+    if (
+        $title === ''
+        && (
+            preg_match('~<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)~iu', $html, $mm)
+            || preg_match('~<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']~iu', $html, $mm)
+        )
+    ) {
+        $title = $decode($mm[1]);
+    }
+
+    if ($title === '' && preg_match('~<title[^>]*>(.*?)</title>~isu', $html, $mm)) {
+        $title = $decode($mm[1]);
+    }
+
+    $diagnostics['title_found'] = ($title !== '');
+
+    if (
+        preg_match('~<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)~iu', $html, $mm)
+        || preg_match('~<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']~iu', $html, $mm)
+    ) {
+        $candidate = html_entity_decode(
+            $mm[1],
+            ENT_QUOTES | ENT_HTML5,
+            'UTF-8'
+        );
+
+        if (
+            filter_var($candidate, FILTER_VALIDATE_URL)
+            && in_array(
+                strtolower((string)parse_url($candidate, PHP_URL_SCHEME)),
+                ['http', 'https'],
+                true
+            )
+        ) {
+            $cover = $candidate;
+        }
+    }
+
+    $artists = [];
+
+    $addArtist = static function ($raw) use (&$artists): void {
+        if (!is_string($raw) && !is_numeric($raw)) {
+            return;
+        }
+
+        $name = trim(
+            html_entity_decode(
+                (string)$raw,
+                ENT_QUOTES | ENT_HTML5,
+                'UTF-8'
+            )
+        );
+
+        $name = preg_replace('/\s+/u', ' ', $name) ?? $name;
+
+        if (
+            $name === ''
+            || (function_exists('mb_strlen')
+                ? mb_strlen($name, 'UTF-8')
+                : strlen($name)) > 190
+        ) {
+            return;
+        }
+
+        $key = function_exists('mb_strtolower')
+            ? mb_strtolower($name, 'UTF-8')
+            : strtolower($name);
+
+        foreach ($artists as $existing) {
+            $existingKey = function_exists('mb_strtolower')
+                ? mb_strtolower($existing, 'UTF-8')
+                : strtolower($existing);
+
+            if ($existingKey === $key) {
+                return;
+            }
+        }
+
+        $artists[] = $name;
+    };
+
+    /*
+     * Поиск артистов в исходной HTML-странице.
+     */
+    if (class_exists('DOMDocument')) {
+        $previousLibxml = libxml_use_internal_errors(true);
+        $artistDom = new DOMDocument();
+
+        if ($artistDom->loadHTML('<?xml encoding="UTF-8">' . $html)) {
+            $artistXpath = new DOMXPath($artistDom);
+            $authorNodes = $artistXpath->query('//*[@data-testid="AudioList_Author"]');
+
+            if ($authorNodes) {
+                $diagnostics['initial_author_blocks'] = $authorNodes->length;
+
+                foreach ($authorNodes as $authorNode) {
+                    $links = $artistXpath->query('.//a', $authorNode);
+
+                    if (!$links) {
+                        continue;
+                    }
+
+                    $diagnostics['initial_artist_links'] += $links->length;
+
+                    foreach ($links as $link) {
+                        $addArtist($link->textContent ?? '');
+                    }
+                }
+            }
+        }
+
+        libxml_clear_errors();
+        libxml_use_internal_errors($previousLibxml);
+    }
+
+    /*
+     * Поиск артистов в JSON исходной страницы.
+     */
+    $decodedHtml = html_entity_decode(
+        $html,
+        ENT_QUOTES | ENT_HTML5,
+        'UTF-8'
+    );
+
+    $decodedHtml = vk_decode_unicode_escapes($decodedHtml);
+
+    if (
+        preg_match_all(
+            '~["\'](?:artist|artist_name|performer)["\']\s*:\s*["\']((?:\\\\.|[^"\'])+)["\']~iu',
+            $decodedHtml,
+            $matches
+        )
+    ) {
+        $diagnostics['json_artist_matches'] += count($matches[1]);
+
+        foreach ($matches[1] as $raw) {
+            $unescaped = json_decode(
+                '"' . str_replace('"', '\\"', $raw) . '"'
+            );
+
+            $addArtist(
+                is_string($unescaped)
+                    ? $unescaped
+                    : stripcslashes($raw)
+            );
+        }
+    }
+
+    /*
+     * Старый формат VK: [audio_id, owner_id, artist, title, ...].
+     */
+    if (
+        preg_match_all(
+            '~\[\s*-?\d+\s*,\s*-?\d+\s*,\s*"((?:\\\\.|[^"\\\\]){1,190})"\s*,\s*"((?:\\\\.|[^"\\\\]){1,300})"~u',
+            $decodedHtml,
+            $legacy,
+            PREG_SET_ORDER
+        )
+    ) {
+        $diagnostics['legacy_audio_rows'] += count($legacy);
+
+        foreach ($legacy as $row) {
+            $artist = json_decode('"' . $row[1] . '"');
+
+            if (is_string($artist)) {
+                $addArtist($artist);
+            }
+        }
+    }
+
+    /*
+     * Если исходная страница не содержит артистов,
+     * сохраняем полный ответ load_section для диагностики.
+     */
+    if (!$artists && $ownerId !== null && $playlistId !== null) {
+        foreach ([
+            'vk.ru' => 'https://vk.ru/al_audio.php',
+            'vk.com' => 'https://vk.com/al_audio.php'
+        ] as $host => $endpoint) {
+            $post = [
+                'al' => 1,
+                'act' => 'load_section',
+                'claim' => 0,
+                'owner_id' => $ownerId,
+                'playlist_id' => $playlistId,
+                'type' => 'playlist'
+            ];
+
+            if ($accessKey !== '') {
+                $post['access_hash'] = $accessKey;
+            }
+
+            $api = curl_init($endpoint);
+
+            curl_setopt_array($api, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => http_build_query($post),
+                CURLOPT_CONNECTTIMEOUT => 5,
+                CURLOPT_TIMEOUT => 12,
+                CURLOPT_ENCODING => '',
+                CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36',
+                CURLOPT_HTTPHEADER => [
+                    'Accept: */*',
+                    'Accept-Language: ru-RU,ru;q=0.9,en;q=0.7',
+                    'Content-Type: application/x-www-form-urlencoded; charset=UTF-8',
+                    'X-Requested-With: XMLHttpRequest',
+                    'Origin: https://vk.ru',
+                    'Referer: ' . $url
+                ],
+                CURLOPT_PROTOCOLS => CURLPROTO_HTTPS
+            ]);
+
+            $response = curl_exec($api);
+            $http = (int)curl_getinfo($api, CURLINFO_HTTP_CODE);
+            $curlError = curl_error($api);
+            curl_close($api);
+
+            $attempt = [
+                'host' => $host,
+                'http' => $http,
+                'bytes' => is_string($response) ? strlen($response) : 0,
+                'author_blocks' => 0,
+                'links' => 0,
+                'debug_file' => null,
+                'curl_error' => $curlError
+            ];
+
+            if (
+                !is_string($response)
+                || $response === ''
+                || $http < 200
+                || $http >= 300
+            ) {
+                $diagnostics['section_attempts'][] = $attempt;
+                continue;
+            }
+
+            /*
+             * Сохраняем именно исходный ответ, до декодирования.
+             */
+            $debugFile = nolabel_vk_save_debug_response(
+                $host,
+                $response
+            );
+
+            $attempt['debug_file'] = $debugFile;
+
+            if ($debugFile !== null) {
+                $diagnostics['debug_files'][] = [
+                    'host' => $host,
+                    'path' => $debugFile,
+                    'bytes' => strlen($response)
+                ];
+            }
+
+            $response = html_entity_decode(
+                $response,
+                ENT_QUOTES | ENT_HTML5,
+                'UTF-8'
+            );
+
+            $response = vk_decode_unicode_escapes($response);
+
+            if (class_exists('DOMDocument')) {
+                $previousLibxml = libxml_use_internal_errors(true);
+                $sectionDom = new DOMDocument();
+
+                if ($sectionDom->loadHTML('<?xml encoding="UTF-8">' . $response)) {
+                    $sectionXpath = new DOMXPath($sectionDom);
+
+                    if ($title === '') {
+                        $sectionTitles = $sectionXpath->query(
+                            '//*[@data-testid="MusicPlaylistPage_Title"]'
+                        );
+
+                        if ($sectionTitles && $sectionTitles->length > 0) {
+                            $sectionTitle = $decode(
+                                (string)$sectionDom->saveHTML(
+                                    $sectionTitles->item(0)
+                                )
+                            );
+
+                            if ($sectionTitle !== '') {
+                                $title = $sectionTitle;
+                                $diagnostics['title_found'] = true;
+                            }
+                        }
+                    }
+
+                    $sectionAuthors = $sectionXpath->query(
+                        '//*[@data-testid="AudioList_Author"]'
+                    );
+
+                    if ($sectionAuthors) {
+                        $attempt['author_blocks'] = $sectionAuthors->length;
+
+                        foreach ($sectionAuthors as $sectionAuthor) {
+                            $sectionLinks = $sectionXpath->query(
+                                './/a',
+                                $sectionAuthor
+                            );
+
+                            if (!$sectionLinks) {
+                                continue;
+                            }
+
+                            $attempt['links'] += $sectionLinks->length;
+
+                            foreach ($sectionLinks as $sectionLink) {
+                                $addArtist($sectionLink->textContent ?? '');
+                            }
+                        }
+                    }
+                }
+
+                libxml_clear_errors();
+                libxml_use_internal_errors($previousLibxml);
+            }
+
+            /*
+             * JSON-поля артистов в ответе load_section.
+             */
+            if (
+                preg_match_all(
+                    '~["\'](?:artist|artist_name|performer)["\']\s*:\s*["\']((?:\\\\.|[^"\'])+)["\']~iu',
+                    $response,
+                    $mm2
+                )
+            ) {
+                $diagnostics['json_artist_matches'] += count($mm2[1]);
+
+                foreach ($mm2[1] as $raw) {
+                    $unescaped = json_decode(
+                        '"' . str_replace('"', '\\"', $raw) . '"'
+                    );
+
+                    $addArtist(
+                        is_string($unescaped)
+                            ? $unescaped
+                            : stripcslashes($raw)
+                    );
+                }
+            }
+
+            /*
+             * Старый формат аудиозаписей в ответе load_section.
+             */
+            if (
+                preg_match_all(
+                    '~\[\s*-?\d+\s*,\s*-?\d+\s*,\s*"((?:\\\\.|[^"\\\\]){1,190})"\s*,\s*"((?:\\\\.|[^"\\\\]){1,300})"~u',
+                    $response,
+                    $mm3,
+                    PREG_SET_ORDER
+                )
+            ) {
+                $diagnostics['legacy_audio_rows'] += count($mm3);
+
+                foreach ($mm3 as $row) {
+                    $artist = json_decode('"' . $row[1] . '"');
+
+                    if (is_string($artist)) {
+                        $addArtist($artist);
+                    }
+                }
+            }
+
+            $diagnostics['section_attempts'][] = $attempt;
+
+            if ($artists) {
+                break;
+            }
+        }
+    }
+
+    if ($title === '') {
+        $title = 'VK playlist ' . ($playlistId ?? '');
+    }
+
+    $diagnostics['artists_found'] = count($artists);
+
+    if (!$artists) {
+        $debugMessage = '';
+
+        if (!empty($diagnostics['debug_files'])) {
+            $paths = [];
+
+            foreach ($diagnostics['debug_files'] as $file) {
+                $paths[] = $file['host'] . ': ' . $file['path'];
+            }
+
+            $debugMessage = ' Диагностические файлы: '
+                . implode(' | ', $paths);
+        }
+
+        return [
+            'ok' => false,
+            'error' => 'VK открыл плейлист, но не удалось автоматически прочитать имена исполнителей. Проверьте диагностические файлы.' . $debugMessage,
+            'diagnostics' => $diagnostics
+        ];
+    }
+
+    return [
+        'ok' => true,
+        'title' => function_exists('mb_substr')
+            ? mb_substr($title, 0, 200, 'UTF-8')
+            : substr($title, 0, 200),
+        'artists' => array_slice($artists, 0, 80),
+        'cover_url' => $cover,
+        'owner_id' => $ownerId,
+        'playlist_id' => $playlistId,
+        'diagnostics' => $diagnostics
+    ];
+}
+
+/**
+ * Refreshes one external entry and appends an immutable cumulative snapshot.
+ */
+function nolabel_sync_release(PDO $pdo, int $id): array
+{
+    $q = $pdo->prepare(
+        'SELECT * FROM nolabel_releases WHERE id = ? LIMIT 1'
+    );
+
+    $q->execute([$id]);
+    $release = $q->fetch(PDO::FETCH_ASSOC);
+
+    if (!$release) {
+        return [
+            'ok' => false,
+            'error' => 'NoLabel-релиз не найден.'
+        ];
+    }
+
+    $stats = vk_fetch_playlist_plays(
+        (string)$release['playlist_url']
+    );
+
+    if (empty($stats['ok'])) {
+        $errorRaw = (string)($stats['error'] ?? 'Ошибка чтения VK.');
+
+        $error = function_exists('mb_substr')
+            ? mb_substr($errorRaw, 0, 500, 'UTF-8')
+            : substr($errorRaw, 0, 500);
+
+        $save = $pdo->prepare(
+            'UPDATE nolabel_releases
+             SET last_checked_at = NOW(), last_error = ?
+             WHERE id = ?'
+        );
+
+        $save->execute([$error, $id]);
+
+        return [
+            'ok' => false,
+            'error' => $error
+        ];
+    }
+
+    $plays = max(0, (int)$stats['plays']);
+
+    $pdo->beginTransaction();
+
+    try {
+        $save = $pdo->prepare(
+            'UPDATE nolabel_releases
+             SET total_plays = ?,
+                 last_checked_at = NOW(),
+                 last_success_at = NOW(),
+                 last_error = NULL
+             WHERE id = ?'
+        );
+
+        $save->execute([$plays, $id]);
+
+        $snapshot = $pdo->prepare(
+            'INSERT INTO nolabel_release_snapshots
+                (nolabel_release_id, total_plays, captured_at)
+             VALUES (?, ?, NOW())'
+        );
+
+        $snapshot->execute([$id, $plays]);
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+
+        throw $e;
+    }
+
+    return [
+        'ok' => true,
+        'plays' => $plays
+    ];
+}
